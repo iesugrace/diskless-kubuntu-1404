@@ -1,0 +1,207 @@
+構建無盤 Kubuntu 14.04 系統
+
+
+系統組成部件
+
+1. dhcp 服務器，用於分配IP地址
+2. tftp 服務器，用於提供Linux 內核和initrd 文件
+3. nfs 服務器，用於提供根目錄的存儲空間
+4. 支持pxe 啓動的客戶機，可以是物理機，也可以是虛擬機
+
+本流程中，所有的服務器都設置在一臺機器上。IP 地址的分配如下：
+服務器：2.2.2.2/7
+客戶機：2.2.2.128-143 (dhcp)
+
+
+
+
+注意事項
+
+部署測試階段，建議把tftp 和nfs 服務器的防火牆關閉，等測試通過之後再打開防火牆測試。
+如果防火牆設置不當，則有可能無法啓動(tftp)，或者雖然能啓動卻不能正常掛載根目錄(nfs)
+
+
+
+流程概述
+
+1. 在服務器上安裝必需的軟件包
+2. 配置dhcp 服務器
+3. 配置tftp 服務器
+4. 配置nfs 服務器
+5. 安裝Kubuntu 14.04 到nfs 服務器上
+6. 測試
+
+
+
+
+詳細流程
+
+1. 在服務器上安裝必需的軟件包
+    sudo apt-get install dhcp3-server tftpd tftp openbsd-inetd nfs-kernel-server syslinux initramfs-tools
+
+
+2. 配置dhcp 服務器
+    DHCP 服務器給客戶機提供IP 地址及PXE 啓動文件的信息。
+
+    2.1 修改dhcp 配置文件 /etc/dhcp/dhcpd.conf，
+    使它看起來像虛線之間的代碼這樣：
+    ---------------------------------------------------
+    allow booting;
+    allow bootp;
+
+    subnet 2.0.0.0 netmask 254.0.0.0 {
+      range 2.2.2.128 2.2.2.143;
+      option broadcast-address 3.255.255.255;
+      option routers 2.2.2.1;
+      option domain-name-servers 8.8.8.8;
+
+      filename "pxelinux.0";
+    }
+    ---------------------------------------------------
+
+    其中 filename 選項後面的pxelinux.0 是tftp 服務器中相對於根目錄的路徑。
+
+    2.2 重啓dhcp 服務器
+        service isc-dhcp-server restart
+
+
+3. 配置tftp 服務器
+
+    3.1 創建tftp 服務器的目錄
+        mkdir -p /tftpboot/pxelinux.cfg
+
+    3.2 復制啓動文件
+        cp /usr/lib/syslinux/pxelinux.0 /tftpboot
+
+    3.3 創建默認的pxe 配置文件 /tftpboot/pxelinux.cfg/default，內容如虛線間一般
+    -------------------------------------------------------------------------------------
+    LABEL linux
+    DEFAULT linux
+    KERNEL vmlinuz-diskless
+    APPEND root=/dev/nfs initrd=initrd.img-diskless nfsroot=2.2.2.2:/nfsroot ip=dhcp rw
+    -------------------------------------------------------------------------------------
+    內核名字就是無盤系統將要使用的內核，initrd 文件是爲無盤啓動特別制作的，nfsroot 就是無盤系統的根目錄的位置。
+
+    3.4 設置文件的權限
+        chmod -R 777 /tftpboot
+
+    3.5 修改配置文件 /etc/inetd.conf，修改其中原有的配置成這樣
+    tftp  dgram  udp  wait  nobody  /usr/sbin/tcpd  /usr/sbin/in.tftpd  /tftpboot
+
+    /tftpboot 就是tftp 服務器的根目錄
+
+    3.6 重啓inetd 服務，因爲tftp 託管在inet 服務上
+        service openbsd-inetd restart
+
+    3.7 查看69 端口是否已經打開
+        lsof -i:69
+
+    3.8 測試下載tftp 上的啓動文件 
+        czl@tool:tmp$ echo "get pxelinux.0" | tftp 2.2.2.2
+        tftp> Received 27116 bytes in 0.0 seconds
+
+        當看到 Received xxx bytes 的字樣時，就表示下載成功。
+
+
+4. 配置nfs 服務器
+
+    4.1 創建一個目錄，用來做無盤系統的根目錄
+        mkdir /nfsroot
+
+    4.2 在 /etc/exports 裏添加以下這一行
+        /nfsroot   2.2.2.0/24(rw,no_root_squash,async,insecure)
+
+        這裏的 2.2.2.0/24 應能包括dhcp 服務器分配出來的所有IP 地址
+
+    4.3 是nfs 配置生效
+        exportfs -avr
+
+
+5. 安裝Kubuntu 14.04 到nfs 服務器上
+
+    5.1 像平常安裝系統一樣在客戶機上安裝一個Kubuntu 14.04，可以安裝在虛擬機上，也可以使用一個已經存在的系統，
+        這個系統就是客戶機要使用的操作系統，可以根據需要安裝各種軟件，對系統做各種調整、配置。
+
+    5.2 在客戶機上，爲網絡啓動定制 initrd 文件
+        5.2.1 修改文件 /etc/initramfs-tools/initramfs.conf 中的BOOT 標志
+            BOOT=nfs
+
+        5.2.2 修改文件 /etc/initramfs-tools/initramfs.conf 中的MODULES 標志
+            MODULES=netboot
+            注意，如果文件 /etc/initramfs-tools/conf.d/driver-policy
+            中有任何內容，這一行將會被忽略。
+
+        5.2.3 把所需的網卡驅動的名字放到文件 /etc/initramfs-tools/modules 中
+            5.2.3.1 找出網卡驅動的名稱
+                czl@tool:~$ lsmod | grep mii
+                mii                    13654  1 r8169
+
+                這裏所使用的網卡驅動名稱是 r8169
+
+            5.2.3.2 把網卡驅動的名稱寫入文件 /etc/initramfs-tools/modules 中，
+                一個名稱一行
+
+        5.2.4 生成一個特制的新的initrd 文件，存放到root 用戶的家目錄
+            mkinitramfs -o /root/initrd.img-diskless
+
+    5.3 在客戶機的系統裏面，掛載nfs 服務器上共享出來的無盤系統的根目錄
+        mkdir /mnt/remote_storage
+        mount 2.2.2.2:/nfsroot /mnt/remote_storage
+
+    5.4 把客戶機上所有的系統文件復制到nfs 服務器，本流程所使用的系統在安裝的時候除了根分區外，
+        並沒有爲/usr 等目錄另外創建分區，所以所有的系統文件都在根分區上，這樣的分區方式也是推薦的方式。
+        cp /boot/vmlinuz-$(uname -r) /root/vmlinuz-diskless
+        cp -ax /. /mnt/remote_storage/
+        cp -ax /dev/. /mnt/remote_storage/dev/
+
+    5.5 在nfs 服務器上，對客戶機傳過來的系統做一些改動，以適應網絡啓動
+
+        5.5.1 把內核文件和initrd 文件復制到tftp 服務器的根目錄
+            cp /nfsroot/root/vmlinuz-diskless /tftpboot/
+            cp /nfsroot/root/initrd.img-diskless /tftpboot/
+
+        5.5.2 修改 /nfsroot/etc/network/interfaces 
+            當從網絡啓動的時候，客戶機在啓動操作系統之前就已經獲得了DHCP 發現信息，
+            所以應該確保操作系統不會再嘗試重新配置網卡，簡單地設置爲 manual 即可。
+            虛線之間的是參考的配置代碼：
+            ----------------------------------------------------------------------
+            # This file describes the network interfaces available on your system
+            # and how to activate them. For more information, see interfaces(5).
+
+            # The loopback network interface
+            auto lo
+            iface lo inet loopback
+
+            # The primary network interface, commented out for NFS root
+            #auto eth0
+            #iface eth0 inet dhcp
+            iface eth0 inet manual
+            ----------------------------------------------------------------------
+
+        5.5.3 配置 /nfsroot/etc/fstab
+            這個文件包含了客戶端在啓動系統的時候要用來掛載文件系統的信息，修改它，
+            使它看起來像虛線之間那樣：
+            ----------------------------------------------------------------------
+            /dev/nfs  /          nfs    defaults  1  1
+            proc      /proc      proc   defaults  0  0
+            none      /tmp       tmpfs  defaults  0  0
+            none      /var/run   tmpfs  defaults  0  0
+            none      /var/lock  tmpfs  defaults  0  0
+            none      /var/tmp   tmpfs  defaults  0  0
+            ----------------------------------------------------------------------
+
+        5.5.4 禁用grub 更新
+            因爲無盤系統啓動的時候不依靠grub，可以通過禁用grub 更新來避免以後安裝
+            軟件時的一些幹擾。把文件 /nfsroot/etc/kernel/postinst.d/zz-update-grub
+            中的代碼 exec update-grub 注釋掉即可
+
+
+6. 測試
+
+    6.1 關閉服務器上的防火牆
+        iptables -F INPUT
+        iptables -P INPUT ACCEPT
+
+    6.2 啓動客戶機，選擇從網卡啓動。如果一切正常的話，客戶機會從dhcp 服務器獲取到一個
+        IP 地址，然後從tftp 服務器獲取到內核文件和initrd 文件，然後開始引導系統，接下
+        來會嘗試掛載nfs 服務器上的目錄作爲客戶機的根目錄，並最終完成整個啓動過程。
